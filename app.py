@@ -1,13 +1,26 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import io
 import re
+import holidays
 
 st.set_page_config(page_title="Générateur de Calendrier de Paiement", layout="wide")
 st.title("Abattement & Calendrier de Paiement Automatique")
+
+# Configuration des jours fériés pour Madagascar (MG)
+feries_mg = holidays.country_holidays('MG')
+
+def trouver_prochain_jour_ouvrable(date_cible):
+    """
+    Vérifie si une date tombe un week-end ou un jour férié à Madagascar,
+    et avance au lundi ou jour ouvrable suivant si nécessaire.
+    """
+    while date_cible.weekday() >= 5 or date_cible in feries_mg:
+        date_cible += timedelta(days=1)
+    return date_cible
 
 def extraire_annee_mois(row):
     months_fr = ['janvier', 'février', 'fevrier', 'mars', 'avril', 'mai', 'juin', 
@@ -62,11 +75,9 @@ def generer_calendrier(df_input, nb_echeances, date_debut):
     df = df_input.copy()
     df.columns = df.columns.str.strip()
     
-    # Gestion de la date légale d'échéance
     if 'Date échéance' in df.columns:
         df['Date_Echeance_Legale'] = pd.to_datetime(df['Date échéance'], dayfirst=True, errors='coerce')
     else:
-        # Si pas de colonne "Date échéance", on va la générer via l'Année / Mois
         df['Date_Echeance_Legale'] = None
 
     annees_propres = []
@@ -79,7 +90,6 @@ def generer_calendrier(df_input, nb_echeances, date_debut):
     df['ANNEE'] = annees_propres
     df['MOIS'] = mois_propres
     
-    # Recréer proprement la date légale si elle manquait
     for idx, row in df.iterrows():
         if pd.isna(row['Date_Echeance_Legale']):
             months_map = {
@@ -92,7 +102,6 @@ def generer_calendrier(df_input, nb_echeances, date_debut):
     df['Principal'] = pd.to_numeric(df['Principal'], errors='coerce').fillna(0)
     df['Amende'] = pd.to_numeric(df['Amende'], errors='coerce').fillna(0)
     
-    # RECHERCHE FLEXIBLE : Détecte 'Pénalité de retard' ou 'Pénalités de retard'
     col_penalite_source = None
     for c in df.columns:
         if 'pénalité' in c.lower() and 'retard' in c.lower():
@@ -106,12 +115,15 @@ def generer_calendrier(df_input, nb_echeances, date_debut):
     
     df = df.sort_values(by='Date_Echeance_Legale').reset_index(drop=True)
     
-    # Le montant moyen inclut TOUT (Principal + Amende + Pénalités existantes de l'input)
     total_base = df['Principal'].sum() + df['Amende'].sum() + df['Pénalités_Initiales'].sum()
     montant_moyen_cible = total_base / nb_echeances
     seuil_max = montant_moyen_cible * 1.10
     
-    dates_calendrier = [date_debut + relativedelta(months=i) for i in range(nb_echeances + 24)]
+    # 1. Génération des dates brutes théoriques (de mois en mois)
+    dates_theoriques = [date_debut + relativedelta(months=i) for i in range(nb_echeances + 24)]
+    # 2. Application immédiate de la règle des jours ouvrables/fériés
+    dates_calendrier = [trouver_prochain_jour_ouvrable(d) for d in dates_theoriques]
+    
     lignes_sortie = []
     idx_echeance_actuelle = 0
     cumul_echeance_courante = 0
@@ -169,13 +181,12 @@ def generer_calendrier(df_input, nb_echeances, date_debut):
     taux_totaux = []
     
     for _, r in df_result.iterrows():
+        dt_cal = datetime.strptime(r['Échéance'], '%Y-%m-%d')
         if r['Principal'] > 0:
-            dt_cal = datetime.strptime(r['Échéance'], '%Y-%m-%d')
             p, t = calculer_penalites(r['Principal'], r['Date_Echeance_Legale'], dt_cal)
             penalites_finales.append(p)
             taux_totaux.append(t)
         else:
-            # S'il n'y a pas de principal, on récupère le montant de la pénalité isolée de l'input
             penalites_finales.append(r['Pénalités_Initiales'])
             taux_totaux.append(0)
         
@@ -183,6 +194,14 @@ def generer_calendrier(df_input, nb_echeances, date_debut):
     df_result['Taux'] = taux_totaux
     df_result['Total'] = df_result['Principal'] + df_result['Amende'] + df_result['Pénalités de retard']
     return df_result, montant_moyen_cible
+
+# Ajout d'une installation silencieuse de holidays au cas où la case 1 n'ait pas été relancée localement
+try:
+    import holidays
+except:
+    import os
+    os.system('pip install -q holidays')
+    import holidays
 
 uploaded_file = st.file_uploader("Étape 1 : Chargez votre fichier (INPUT)", type=["csv", "xlsx"])
 if uploaded_file is not None:
@@ -211,6 +230,7 @@ if uploaded_file is not None:
             df_clean = df_out[[c for c in cols_to_show if c in df_out.columns]].copy()
             
             final_rows = []
+            # Parcours et injection des SOUS-TOTAUX par échéance
             for echeance_date, group in df_clean.groupby('Échéance', sort=True):
                 for _, row in group.iterrows():
                     final_rows.append(row.to_dict())
@@ -225,10 +245,22 @@ if uploaded_file is not None:
                     'Total': group['Total'].sum()
                 }
                 final_rows.append(subtotal_row)
+            
+            # --- INJECTION DU TOTAL GÉNÉRAL TOUT EN BAS ---
+            total_general_row = {
+                'Échéance': 'TOTAL GÉNÉRAL',
+                'NATURE': '', 'ANNEE': '', 'MOIS': '',
+                'Principal': df_clean['Principal'].sum(),
+                'Amende': df_clean['Amende'].sum(),
+                'Pénalités de retard': df_clean['Pénalités de retard'].sum(),
+                'Taux': np.nan,
+                'Total': df_clean['Total'].sum()
+            }
+            final_rows.append(total_general_row)
                 
             df_final_with_subtotals = pd.DataFrame(final_rows)
             
-            st.subheader("📋 Calendrier Format OUTPUT")
+            st.subheader("📋 Calendrier Format OUTPUT (Avec Jours Ouvrables et Totaux)")
             st.dataframe(df_final_with_subtotals.style.format({
                 'Principal': '{:,.2f}',
                 'Amende': '{:,.2f}',
